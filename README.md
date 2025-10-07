@@ -5,5 +5,5 @@ Project is a pure copy paste to your apps script; need to copy both files, and e
 
 Updated now with FIFO and automatic deletion once it receives 200 OK from webhook receiver.
 
-What i might implement; media forwarding   
+What i might implement; media forwarding        
 
