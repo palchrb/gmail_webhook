@@ -172,8 +172,12 @@ function processUnreadInboxOnce() {
       return;
     }
 
-    // 3) Process each claimed message
-    claimed.forEach(id => {
+    // === FIFO: sorter claimed etter internalDate og prosesser sekvensielt ===
+    const orderedClaimed = orderByInternalDate_(claimed);
+
+    // 3) Process each claimed message SEQUENTIALLY (FIFO)
+    for (let i = 0; i < orderedClaimed.length; i++) {
+      const id = orderedClaimed[i];
       let adv, headers, basic, bodies;
       try {
         adv = Gmail.Users.Messages.get(userId, id, { format: 'full' });
@@ -182,7 +186,7 @@ function processUnreadInboxOnce() {
         Logger.log('[proc] Fetch (Advanced) failed for %s: %s', id, e);
         // Give up claim, leave UNREAD so a later run can reattempt
         try { Gmail.Users.Messages.modify({ addLabelIds: [], removeLabelIds: [ids.processingId] }, userId, id); } catch (_){}
-        return;
+        continue;
       }
 
       // Prefer GmailApp for bodies (robust)
@@ -198,24 +202,24 @@ function processUnreadInboxOnce() {
       if (!alias || !entry) {
         Logger.log('[proc] No subscribed alias → mark read. id=%s alias=%s', id, alias);
         safeMarkRead_('me', id, ids.processingId);
-        return;
+        continue;
       }
 
       // Gate 2: optional SPF/DKIM/DMARC
       if (CONFIG.REQUIRE_AUTH_RESULTS && !passesAuth(headers)) {
         Logger.log('[proc] AuthResults failed → mark read. id=%s', id);
         safeMarkRead_('me', id, ids.processingId);
-        return;
+        continue;
       }
 
       // Gate 3: per-alias rate limit
       if (!allowRate(alias, CONFIG.RATE_PER_MIN)) {
         Logger.log('[proc] Rate-limited alias=%s → mark read. id=%s', alias, id);
         safeMarkRead_('me', id, ids.processingId);
-        return;
+        continue;
       }
 
-      // Build payload (same shape as your test helper)
+      // Build payload
       const payload = {
         type: 'inreach.email',
         alias,
@@ -237,17 +241,26 @@ function processUnreadInboxOnce() {
           addLabelIds: [ids.doneId],
           removeLabelIds: ['UNREAD', ids.processingId]
         }, userId, id);
-        Logger.log('[proc] Delivered OK. id=%s alias=%s', id, alias);
+
+        // === PRIVACY: permanent delete etter vellykket levering ===
+        try {
+          Gmail.Users.Messages.remove(userId, id);
+          Logger.log('[proc] Delivered OK and permanently deleted. id=%s alias=%s', id, alias);
+        } catch (delErr) {
+          Logger.log('[proc] Permanent delete failed for %s: %s', id, delErr);
+        }
+
       } catch (sendErr) {
         // Keep Processing → sweeper will retry
         Logger.log('[proc] Delivery failed (kept Processing) id=%s err=%s', id, sendErr);
       }
-    });
+    }
 
   } finally {
     lock.releaseLock();
   }
 }
+
 
 /** ========= SWEEPER (retry stuck Processing) ========= */
 function retryProcessingStuck() {
@@ -312,7 +325,15 @@ function retryProcessingStuck() {
           addLabelIds: [doneId],
           removeLabelIds: ['UNREAD', processingId]
         }, 'me', full.id);
-        Logger.log('[sweeper] Delivered OK. id=%s alias=%s', full.id, alias);
+
+        // === PRIVACY: permanent delete etter vellykket levering i sweeper ===
+        try {
+          Gmail.Users.Messages.remove('me', full.id);
+          Logger.log('[sweeper] Delivered OK and permanently deleted. id=%s alias=%s', full.id, alias);
+        } catch (delErr) {
+          Logger.log('[sweeper] Permanent delete failed for %s: %s', full.id, delErr);
+        }
+
       } catch (e) {
         Logger.log('[sweeper] Delivery failed (kept Processing) id=%s err=%s', full.id, e);
       }
@@ -321,6 +342,7 @@ function retryProcessingStuck() {
     pageToken = res.nextPageToken || null;
   } while (pageToken);
 }
+
 
 /** ========= LABELS ========= */
 function ensureStateLabels() {
@@ -724,3 +746,23 @@ function resolveLabelIds_(namesOrIds) {
   return out;
 }
 
+function orderByInternalDate_(ids) {
+  const enriched = [];
+  ids.forEach(id => {
+    try {
+      const msg = Gmail.Users.Messages.get('me', id, { format: 'metadata', metadataHeaders: ['Date'] });
+      let ts = Number(msg.internalDate || 0);
+      if (!ts && msg.payload && msg.payload.headers) {
+        const h = headerMap_(msg.payload.headers);
+        const d = h['date'] ? Date.parse(h['date']) : 0;
+        ts = isNaN(d) ? 0 : d;
+      }
+      enriched.push({ id, ts });
+    } catch (e) {
+      Logger.log('[fifo] metadata fail %s: %s', id, e);
+      enriched.push({ id, ts: 0 });
+    }
+  });
+  enriched.sort((a, b) => a.ts - b.ts);
+  return enriched.map(x => x.id);
+}
